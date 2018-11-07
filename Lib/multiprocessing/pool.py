@@ -13,6 +13,12 @@ __all__ = ['Pool', 'ThreadPool']
 # Imports
 #
 
+class BrokenProcessPool(RuntimeError):
+    """
+    Raised when a process in a ProcessPoolExecutor terminated abruptly
+    while a future was in the running state.
+    """
+
 import threading
 import queue
 import itertools
@@ -25,6 +31,7 @@ import traceback
 # we avoid top-level imports which are liable to fail on some systems.
 from . import util
 from . import get_context, TimeoutError
+from .connection import wait
 
 #
 # Constants representing the state of a pool
@@ -33,6 +40,7 @@ from . import get_context, TimeoutError
 RUN = 0
 CLOSE = 1
 TERMINATE = 2
+BROKEN = 3
 
 #
 # Miscellaneous
@@ -129,6 +137,8 @@ def worker(inqueue, outqueue, initializer=None, initargs=(), maxtasks=None,
                 wrapped))
             put((job, i, (False, wrapped)))
         completed += 1
+    # Let result_handler thread know worker is exiting gracefully.
+    put(os.getpid())
     util.debug('worker exiting after %d tasks' % completed)
 
 #
@@ -167,9 +177,14 @@ class Pool(object):
         self._pool = []
         self._repopulate_pool()
 
+        # This lock is used to ensure we don't try to send the shut
+        # down sentinel to worker processes while we're in the process
+        # of repopulating the pool.
+        self._repopulate_lock = threading.Lock()
+
         self._worker_handler = threading.Thread(
             target=Pool._handle_workers,
-            args=(self, )
+            args=(self, self._repopulate_lock)
             )
         self._worker_handler.daemon = True
         self._worker_handler._state = RUN
@@ -185,9 +200,11 @@ class Pool(object):
         self._task_handler._state = RUN
         self._task_handler.start()
 
+
         self._result_handler = threading.Thread(
-            target=Pool._handle_results,
-            args=(self._outqueue, self._quick_get, self._cache)
+            target=self._handle_results,
+            args=(self._outqueue, self._quick_get, self._cache,
+                  self._repopulate_lock, self)
             )
         self._result_handler.daemon = True
         self._result_handler._state = RUN
@@ -201,13 +218,19 @@ class Pool(object):
             exitpriority=15
             )
 
-    def _join_exited_workers(self):
+    def _join_exited_workers(self, wait_pid=None):
         """Cleanup after any worker processes which have exited due to reaching
         their specified lifetime.  Returns True if any workers were cleaned up.
+
+        If pid is provided, explicitly call join() on an process matching that
+        pid.
+
         """
         cleaned = False
         for i in reversed(range(len(self._pool))):
             worker = self._pool[i]
+            if worker.pid == wait_pid:
+                worker.join()
             if worker.exitcode is not None:
                 # worker exited
                 util.debug('cleaning up worker %d' % i)
@@ -233,17 +256,22 @@ class Pool(object):
             w.start()
             util.debug('added worker')
 
-    def _maintain_pool(self):
-        """Clean up any exited workers and start replacements for them.
+    def _maintain_pool(self, wait_pid=None):
+        """ Clean up any exited workers and start replacements for them.
+
+        If pid is provided, explicitly join() the Process with that pid,
+        since it will be exiting very soon.
+
         """
-        if self._join_exited_workers():
-            self._repopulate_pool()
+        if self._join_exited_workers(wait_pid=wait_pid):
+            if self._state == RUN or (self._cache and self._state != TERMINATE):
+                self._repopulate_pool()
 
     def _setup_queues(self):
         self._inqueue = self._ctx.SimpleQueue()
         self._outqueue = self._ctx.SimpleQueue()
         self._quick_put = self._inqueue._writer.send
-        self._quick_get = self._outqueue._reader.recv
+        self._quick_get = self._outqueue._reader
 
     def apply(self, func, args=(), kwds={}):
         '''
@@ -357,16 +385,16 @@ class Pool(object):
         return result
 
     @staticmethod
-    def _handle_workers(pool):
+    def _handle_workers(pool, repopulate_lock):
         thread = threading.current_thread()
 
         # Keep maintaining workers until the cache gets drained, unless the pool
         # is terminated.
         while thread._state == RUN or (pool._cache and thread._state != TERMINATE):
-            pool._maintain_pool()
             time.sleep(0.1)
         # send sentinel to stop workers
-        pool._taskqueue.put(None)
+        with repopulate_lock:
+            pool._taskqueue.put(None)
         util.debug('worker handler exiting')
 
     @staticmethod
@@ -412,10 +440,45 @@ class Pool(object):
         util.debug('task handler exiting')
 
     @staticmethod
-    def _handle_results(outqueue, get, cache):
+    def _handle_broken_pool(reader, pool, cache):
+        """ Handle case where a process has unexpectedly exited.
+
+        If a Process has exited without alerting the result_handler
+        thread first, we need to close/terminate the pool and abort
+        all running tasks.
+
+        """
+        sentinels = [p.sentinel for p in pool._pool]
+        assert sentinels
+        ready = wait([reader] + sentinels)
+        if reader not in ready:
+            pool.close()
+            for i, cache_ent in list(cache.items()):
+                err = BrokenProcessPool('A child process '
+                    'terminated abruptly while the worker '
+                    'was still executing.')
+                cache_ent._set(i, (False, err))
+            # Mark handler as broken. We need this for terminate
+            # to succeed.
+            thread = threading.current_thread()
+            thread._state = BROKEN
+            pool.terminate()
+            return True
+        return False
+
+    @classmethod
+    def _handle_results(cls, outqueue, reader, cache, repopulate_lock, pool):
         thread = threading.current_thread()
 
+        # ProcessPool passes _reader, ThreadPool passes a get method.
+        get = reader.recv if hasattr(reader, 'recv') else reader
+
         while 1:
+            # Determine if the Pool has been broken.
+            if cls._handle_broken_pool(reader, pool, cache):
+                util.debug("pool is broken")
+                break
+
             try:
                 task = get()
             except (OSError, EOFError):
@@ -430,6 +493,13 @@ class Pool(object):
             if task is None:
                 util.debug('result handler got sentinel')
                 break
+
+            if isinstance(task, int):
+                # A worker is exiting due to maxtasksperchild. Wait
+                # for that process to actually exit before continuing.
+                with repopulate_lock:
+                    pool._maintain_pool(wait_pid=task)
+                continue
 
             job, i, obj = task
             try:
@@ -446,6 +516,8 @@ class Pool(object):
 
             if task is None:
                 util.debug('result handler ignoring extra sentinel')
+                continue
+            if isinstance(task, int):
                 continue
             job, i, obj = task
             try:
@@ -523,7 +595,10 @@ class Pool(object):
         task_handler._state = TERMINATE
 
         util.debug('helping task handler/workers to finish')
-        cls._help_stuff_finish(inqueue, task_handler, len(pool))
+        # Skip _help_finish_stuff if the pool is broken, because
+        # the broken process may have beeen holding the inqueue lock.
+        if not result_handler._state == BROKEN:
+            cls._help_stuff_finish(inqueue, task_handler, len(pool))
 
         assert result_handler.is_alive() or len(cache) == 0
 
@@ -744,6 +819,10 @@ class ThreadPool(Pool):
         self._outqueue = queue.Queue()
         self._quick_put = self._inqueue.put
         self._quick_get = self._outqueue.get
+
+    @staticmethod
+    def _handle_broken_pool(reader, pool, cache):
+        return False
 
     @staticmethod
     def _help_stuff_finish(inqueue, task_handler, size):

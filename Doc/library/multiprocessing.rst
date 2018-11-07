@@ -1885,6 +1885,12 @@ with the :class:`Pool` class.
    .. versionadded:: 3.4
       *context*
 
+   .. versionchanged:: 3.5
+      When one of the worker processes terminates abruptly, a
+      :exc:`BrokenProcessPool` error is now raised.  Previously, behaviour
+      was undefined but operations on the :class:`Pool` or its workers would
+      often freeze or deadlock.
+
    .. note::
 
       Worker processes within a :class:`Pool` typically live for the complete
@@ -1996,6 +2002,14 @@ with the :class:`Pool` class.
 
       Wait for the worker processes to exit.  One must call :meth:`close` or
       :meth:`terminate` before using :meth:`join`.
+
+   .. exception:: BrokenProcessPool
+
+      Derived from :exc:`RuntimeError`, this exception class is raised when
+      one of the workers of a :class:`Pool` has terminated
+      in a non-clean fashion (for example, if it was killed from the outside).
+
+      .. versionadded:: 3.5
 
    .. versionadded:: 3.3
       Pool objects now support the context manager protocol -- see
